@@ -1,0 +1,12 @@
+# Игнорировать всё по умолчанию
+*
+
+# Разрешить только необходимые файлы
+!.gitignore
+!Cargo.toml
+!Cargo.lock
+!.env.example
+!rustfmt.toml
+!src/
+!src/**
+!whitelist.txt
