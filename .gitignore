@@ -9,4 +9,3 @@
 !rustfmt.toml
 !src/
 !src/**
-!whitelist.txt
