@@ -7,6 +7,7 @@ name = "NStgbR"
 version = "0.1.0"
 dependencies = [
  "dotenv",
+ "futures",
  "log",
  "pretty_env_logger",
  "teloxide",

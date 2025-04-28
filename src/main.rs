@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dotenv::dotenv;
-use log::{error, info, warn};
+use futures::future::BoxFuture;
+use log::{debug, error, info, warn};
 use teloxide::dispatching::Dispatcher;
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, ChatMemberStatus, Message, MessageId, UserId};
@@ -14,7 +15,7 @@ use tokio::sync::Mutex;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 enum Command {
     Start,
     Confirm,
@@ -39,6 +40,7 @@ struct ForbiddenPatterns {
 
 impl ForbiddenPatterns {
     fn load(path: &str) -> Self {
+        info!("Loading forbidden patterns from {}", path);
         let mut starts_with = Vec::new();
         let mut contains = Vec::new();
 
@@ -58,6 +60,11 @@ impl ForbiddenPatterns {
             }
         }
 
+        info!(
+            "Loaded {} starts_with and {} contains patterns",
+            starts_with.len(),
+            contains.len()
+        );
         Self {
             starts_with,
             contains,
@@ -80,6 +87,7 @@ struct BotState {
 
 impl BotState {
     fn new(group_chat_id: ChatId, whitelist_file: &str, patterns_file: &str) -> Self {
+        info!("Initializing BotState for group {}", group_chat_id.0);
         Self {
             whitelist: Mutex::new(Self::load_whitelist(whitelist_file)),
             whitelist_file: whitelist_file.to_string(),
@@ -89,9 +97,14 @@ impl BotState {
     }
 
     fn load_whitelist(path: &str) -> HashSet<UserId> {
+        info!("Loading whitelist from {}", path);
         let mut whitelist = HashSet::new();
 
         if !Path::new(path).exists() {
+            warn!(
+                "Whitelist file {} does not exist, creating empty whitelist",
+                path
+            );
             return whitelist;
         }
 
@@ -102,6 +115,7 @@ impl BotState {
                         whitelist.insert(UserId(id));
                     }
                 }
+                info!("Loaded {} whitelisted users", whitelist.len());
             }
             Err(e) => error!("Failed to load whitelist: {}", e),
         }
@@ -109,6 +123,7 @@ impl BotState {
     }
 
     async fn add_to_whitelist(&self, user_id: UserId, username: &str) -> Result<()> {
+        info!("Adding user {} ({}) to whitelist", user_id.0, username);
         let mut whitelist = self.whitelist.lock().await;
         if whitelist.insert(user_id) {
             let mut file = OpenOptions::new()
@@ -116,24 +131,86 @@ impl BotState {
                 .append(true)
                 .open(&self.whitelist_file)?;
             writeln!(file, "{} {}", user_id.0, username)?;
+            info!("Successfully added user {} to whitelist file", user_id.0);
+        } else {
+            warn!("User {} was already in whitelist", user_id.0);
         }
         Ok(())
     }
 
     async fn is_whitelisted(&self, user_id: UserId) -> bool {
-        self.whitelist.lock().await.contains(&user_id)
+        let whitelist = self.whitelist.lock().await;
+        let is_whitelisted = whitelist.contains(&user_id);
+        debug!(
+            "Checking if user {} is whitelisted: {}",
+            user_id.0, is_whitelisted
+        );
+        is_whitelisted
     }
 
     async fn check_message(&self, text: &str) -> bool {
         let patterns = self.forbidden_patterns.lock().await;
-        patterns.matches(text)
+        let matches = patterns.matches(text);
+        if matches {
+            warn!("Message matched forbidden patterns: '{}'", text);
+        }
+        matches
     }
+}
+
+async fn retry_telegram_request<F, T>(action: F, action_name: &str) -> Result<T>
+where
+    F: Fn() -> BoxFuture<'static, Result<T>>,
+{
+    let mut attempts = 0;
+    let max_attempts = 3; // Уменьшено количество попыток для более быстрого реагирования
+    let mut last_error = None;
+
+    while attempts < max_attempts {
+        attempts += 1;
+        match action().await {
+            Ok(result) => {
+                info!(
+                    "Successfully completed {} after {} attempts",
+                    action_name, attempts
+                );
+                return Ok(result);
+            }
+            Err(e) => {
+                last_error = Some(e);
+                let delay = Duration::from_millis(500 * attempts); // Уменьшена задержка между попытками
+                warn!(
+                    "Attempt {} of {} failed for {}: {:?}. Retrying in {:?}",
+                    attempts, max_attempts, action_name, last_error, delay
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+
+    error!(
+        "Failed to complete {} after {} attempts. Last error: {:?}",
+        action_name, max_attempts, last_error
+    );
+    Err(last_error.unwrap())
 }
 
 async fn handle_start(bot: Bot, msg: Message, state: Arc<BotState>) -> Result<()> {
     let user = match msg.from.as_ref() {
-        Some(user) => user,
-        None => return Ok(()),
+        Some(user) => {
+            info!(
+                "Received /start from user {} ({} @{}) in chat {}",
+                user.id,
+                user.full_name(),
+                user.username.as_deref().unwrap_or(""),
+                msg.chat.id
+            );
+            user
+        }
+        None => {
+            warn!("Received /start without user info");
+            return Ok(());
+        }
     };
 
     let text = if state.is_whitelisted(user.id).await {
@@ -142,39 +219,132 @@ async fn handle_start(bot: Bot, msg: Message, state: Arc<BotState>) -> Result<()
         "👋 Для доступа к группе:\n1. Оставайтесь в группе\n2. Отправьте /confirm здесь"
     };
 
-    let response = bot.send_message(msg.chat.id, text).await?;
-    delete_message_later(bot, msg.chat.id, response.id);
+    let chat_id = msg.chat.id;
+    let bot_clone = bot.clone();
+    let response = retry_telegram_request(
+        move || {
+            let text = text.to_owned();
+            let bot = bot_clone.clone();
+            Box::pin(async move {
+                info!("Sending start response to chat {}", chat_id);
+                bot.send_message(chat_id, text).await.map_err(|e| e.into())
+            })
+        },
+        "send start response",
+    )
+    .await?;
+
+    info!("Scheduled deletion of start response in chat {}", chat_id);
+    delete_message_later(bot, chat_id, response.id);
     Ok(())
 }
 
 async fn handle_confirm(bot: Bot, msg: Message, state: Arc<BotState>) -> Result<()> {
     let user = match msg.from.as_ref() {
-        Some(user) => user,
-        None => return Ok(()),
+        Some(user) => {
+            info!(
+                "Received /confirm from user {} ({} @{}) in chat {}",
+                user.id,
+                user.full_name(),
+                user.username.as_deref().unwrap_or(""),
+                msg.chat.id
+            );
+            user
+        }
+        None => {
+            warn!("Received /confirm without user info");
+            return Ok(());
+        }
     };
 
-    if let Err(e) = bot.delete_message(msg.chat.id, msg.id).await {
-        warn!("Failed to delete message: {}", e);
-    }
+    let chat_id = msg.chat.id;
+    let message_id = msg.id;
+    let bot_clone = bot.clone();
+
+    info!(
+        "Deleting /confirm command from user {} in chat {}",
+        user.id, chat_id
+    );
+    retry_telegram_request(
+        move || {
+            let bot = bot_clone.clone();
+            Box::pin(async move {
+                bot.delete_message(chat_id, message_id)
+                    .await
+                    .map_err(|e| e.into())
+            })
+        },
+        "delete confirm command",
+    )
+    .await?;
 
     if state.is_whitelisted(user.id).await {
-        let response = bot
-            .send_message(msg.chat.id, "ℹ️ Вы уже подтверждены")
-            .await?;
-        delete_message_later(bot, msg.chat.id, response.id);
+        info!("User {} is already whitelisted", user.id);
+        let bot_clone = bot.clone();
+        let response = retry_telegram_request(
+            move || {
+                let bot = bot_clone.clone();
+                Box::pin(async move {
+                    bot.send_message(chat_id, "ℹ️ Вы уже подтверждены")
+                        .await
+                        .map_err(|e| e.into())
+                })
+            },
+            "send already confirmed message",
+        )
+        .await?;
+        delete_message_later(bot.clone(), chat_id, response.id);
         return Ok(());
     }
 
-    match bot.get_chat_member(state.group_chat_id, user.id).await {
-        Ok(member) if is_member(&member) => {
-            let username = user.username.as_deref().unwrap_or(&user.first_name);
+    let group_chat_id = state.group_chat_id;
+    let user_id = user.id;
+    let bot_clone = bot.clone();
 
-            if let Err(e) = state.add_to_whitelist(user.id, username).await {
+    info!(
+        "Checking group membership for user {} in group {}",
+        user_id, group_chat_id
+    );
+    match retry_telegram_request(
+        move || {
+            let bot = bot_clone.clone();
+            Box::pin(async move {
+                bot.get_chat_member(group_chat_id, user_id)
+                    .await
+                    .map_err(|e| e.into())
+            })
+        },
+        "get chat member",
+    )
+    .await
+    {
+        Ok(member) if is_member(&member) => {
+            let username = user
+                .username
+                .as_deref()
+                .unwrap_or(&user.first_name)
+                .to_owned();
+            info!(
+                "User {} is a member of group {}, adding to whitelist",
+                user_id, group_chat_id
+            );
+
+            if let Err(e) = state.add_to_whitelist(user.id, &username).await {
                 error!("Failed to add to whitelist: {}", e);
-                let response = bot
-                    .send_message(msg.chat.id, "⚠️ Ошибка. Попробуйте позже")
-                    .await?;
-                delete_message_later(bot, msg.chat.id, response.id);
+                let bot_clone = bot.clone();
+                let response = retry_telegram_request(
+                    move || {
+                        let bot = bot_clone.clone();
+                        Box::pin(async move {
+                            bot.send_message(chat_id, "⚠️ Ошибка. Попробуйте позже")
+                                .await
+                                .map_err(|e| e.into())
+                        })
+                    },
+                    "send whitelist error",
+                )
+                .await?;
+                delete_message_later(bot.clone(), chat_id, response.id);
                 return Ok(());
             }
 
@@ -183,17 +353,66 @@ async fn handle_confirm(bot: Bot, msg: Message, state: Arc<BotState>) -> Result<
                 _ => "👑 Админ подтверждён!",
             };
 
-            let response = bot.send_message(msg.chat.id, text).await?;
-            delete_message_later(bot, msg.chat.id, response.id);
+            info!("User {} successfully confirmed", user_id);
+            let bot_clone = bot.clone();
+            let response = retry_telegram_request(
+                move || {
+                    let text = text.to_owned();
+                    let bot = bot_clone.clone();
+                    Box::pin(
+                        async move { bot.send_message(chat_id, text).await.map_err(|e| e.into()) },
+                    )
+                },
+                "send confirmation message",
+            )
+            .await?;
+            delete_message_later(bot.clone(), chat_id, response.id);
         }
-        _ => {
-            let response = bot
-                .send_message(
-                    msg.chat.id,
-                    "❌ Вы должны быть участником группы для подтверждения!",
-                )
-                .await?;
-            delete_message_later(bot, msg.chat.id, response.id);
+        Ok(_) => {
+            warn!(
+                "User {} is not a member of group {}",
+                user_id, group_chat_id
+            );
+            let bot_clone = bot.clone();
+            let response = retry_telegram_request(
+                move || {
+                    let bot = bot_clone.clone();
+                    Box::pin(async move {
+                        bot.send_message(
+                            chat_id,
+                            "❌ Вы должны быть участником группы для подтверждения!",
+                        )
+                        .await
+                        .map_err(|e| e.into())
+                    })
+                },
+                "send not member message",
+            )
+            .await?;
+            delete_message_later(bot.clone(), chat_id, response.id);
+        }
+        Err(e) => {
+            error!(
+                "Failed to check group membership for user {}: {}",
+                user.id, e
+            );
+            let bot_clone = bot.clone();
+            let response = retry_telegram_request(
+                move || {
+                    let bot = bot_clone.clone();
+                    Box::pin(async move {
+                        bot.send_message(
+                            chat_id,
+                            "⚠️ Ошибка проверки членства в группе. Попробуйте позже.",
+                        )
+                        .await
+                        .map_err(|e| e.into())
+                    })
+                },
+                "send membership check error",
+            )
+            .await?;
+            delete_message_later(bot.clone(), chat_id, response.id);
         }
     }
 
@@ -208,32 +427,86 @@ fn is_member(member: &teloxide::types::ChatMember) -> bool {
 }
 
 async fn handle_group_message(bot: Bot, msg: Message, state: Arc<BotState>) -> Result<()> {
-    if let Some(user) = &msg.from {
+    if let Some(user) = msg.from.clone() {
+        info!(
+            "Processing message from user {} ({} @{}) in chat {}: {}",
+            user.id,
+            user.full_name(),
+            user.username.as_deref().unwrap_or(""),
+            msg.chat.id,
+            msg.text().unwrap_or("[non-text message]")
+        );
+
         // Проверяем команды только для текстовых сообщений
         if let Some(text) = msg.text() {
             if let Some(cmd) = Command::parse(text) {
+                info!("Detected command {:?} from user {}", cmd, user.id);
                 match cmd {
-                    Command::Start => return handle_start(bot, msg, state).await,
-                    Command::Confirm => return handle_confirm(bot, msg, state).await,
+                    Command::Start => {
+                        return handle_start(bot.clone(), msg.clone(), state.clone()).await
+                    }
+                    Command::Confirm => {
+                        return handle_confirm(bot.clone(), msg.clone(), state.clone()).await
+                    }
                 }
             }
         }
 
+        let chat_id = msg.chat.id;
+        let message_id = msg.id;
+        let user_first_name = user.first_name.clone();
+        let bot_clone = bot.clone();
+
         // Для неподтверждённых пользователей удаляем ЛЮБОЕ сообщение
         if !state.is_whitelisted(user.id).await {
-            if let Err(e) = bot.delete_message(msg.chat.id, msg.id).await {
-                warn!("Failed to delete message: {}", e);
+            warn!("User {} is not whitelisted, deleting message", user.id);
+            if let Err(e) = retry_telegram_request(
+                move || {
+                    let bot = bot_clone.clone();
+                    Box::pin(async move {
+                        info!(
+                            "Deleting message from unwhitelisted user {} in chat {}",
+                            user.id, chat_id
+                        );
+                        bot.delete_message(chat_id, message_id)
+                            .await
+                            .map_err(|e| e.into())
+                    })
+                },
+                "delete unwhitelisted message",
+            )
+            .await
+            {
+                error!(
+                    "Failed to delete message from unwhitelisted user {}: {}",
+                    user.id, e
+                );
             }
 
             // Отправляем предупреждение только для текстовых сообщений (чтобы не спамить)
             if msg.text().is_some() {
-                let response = bot
-                    .send_message(
-                        msg.chat.id,
-                        format!("{}, для доступа отправьте /confirm", user.first_name),
-                    )
-                    .await?;
-                delete_message_later(bot, msg.chat.id, response.id);
+                info!(
+                    "Sending warning to unwhitelisted user {} in chat {}",
+                    user.id, chat_id
+                );
+                let bot_clone = bot.clone();
+                let response = retry_telegram_request(
+                    move || {
+                        let user_first_name = user_first_name.clone();
+                        let bot = bot_clone.clone();
+                        Box::pin(async move {
+                            bot.send_message(
+                                chat_id,
+                                format!("{}, для доступа отправьте /confirm", user_first_name),
+                            )
+                            .await
+                            .map_err(|e| e.into())
+                        })
+                    },
+                    "send unwhitelisted warning",
+                )
+                .await?;
+                delete_message_later(bot.clone(), chat_id, response.id);
             }
             return Ok(());
         }
@@ -241,17 +514,59 @@ async fn handle_group_message(bot: Bot, msg: Message, state: Arc<BotState>) -> R
         // Для подтверждённых пользователей проверяем запрещённые паттерны в текстовых сообщениях
         if let Some(text) = msg.text() {
             if state.check_message(text).await {
-                if let Err(e) = bot.delete_message(msg.chat.id, msg.id).await {
-                    warn!("Failed to delete message: {}", e);
+                warn!(
+                    "Message from user {} contains forbidden pattern, deleting",
+                    user.id
+                );
+                let bot_clone = bot.clone();
+                if let Err(e) = retry_telegram_request(
+                    move || {
+                        let bot = bot_clone.clone();
+                        Box::pin(async move {
+                            info!(
+                                "Deleting forbidden message from user {} in chat {}",
+                                user.id, chat_id
+                            );
+                            bot.delete_message(chat_id, message_id)
+                                .await
+                                .map_err(|e| e.into())
+                        })
+                    },
+                    "delete forbidden message",
+                )
+                .await
+                {
+                    error!(
+                        "Failed to delete forbidden message from user {}: {}",
+                        user.id, e
+                    );
                 }
 
-                let response = bot
-                    .send_message(
-                        msg.chat.id,
-                        format!("{}, ваше сообщение нарушает правила чата!", user.first_name),
-                    )
-                    .await?;
-                delete_message_later(bot, msg.chat.id, response.id);
+                let bot_clone = bot.clone();
+                let response = retry_telegram_request(
+                    move || {
+                        let user_first_name = user_first_name.clone();
+                        let bot = bot_clone.clone();
+                        Box::pin(async move {
+                            info!(
+                                "Sending warning about forbidden pattern to user {} in chat {}",
+                                user.id, chat_id
+                            );
+                            bot.send_message(
+                                chat_id,
+                                format!(
+                                    "{}, ваше сообщение нарушает правила чата!",
+                                    user_first_name
+                                ),
+                            )
+                            .await
+                            .map_err(|e| e.into())
+                        })
+                    },
+                    "send forbidden pattern warning",
+                )
+                .await?;
+                delete_message_later(bot.clone(), chat_id, response.id);
             }
         }
     }
@@ -259,10 +574,33 @@ async fn handle_group_message(bot: Bot, msg: Message, state: Arc<BotState>) -> R
 }
 
 fn delete_message_later(bot: Bot, chat_id: ChatId, message_id: MessageId) {
+    info!(
+        "Scheduling deletion of message {} in chat {} in 30 seconds",
+        message_id, chat_id
+    );
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(30)).await;
-        if let Err(e) = bot.delete_message(chat_id, message_id).await {
-            warn!("Failed to delete message: {}", e);
+        if let Err(e) = retry_telegram_request(
+            move || {
+                let bot = bot.clone();
+                Box::pin(async move {
+                    info!(
+                        "Executing scheduled deletion of message {} in chat {}",
+                        message_id, chat_id
+                    );
+                    bot.delete_message(chat_id, message_id)
+                        .await
+                        .map_err(|e| e.into())
+                })
+            },
+            "delete delayed message",
+        )
+        .await
+        {
+            error!(
+                "Failed to delete scheduled message {} in chat {}: {}",
+                message_id, chat_id, e
+            );
         }
     });
 }
@@ -279,6 +617,8 @@ async fn main() {
         .unwrap_or("-1001380105834".to_string())
         .parse::<i64>()
         .expect("Invalid GROUP_CHAT_ID");
+
+    info!("Group chat ID: {}", group_chat_id);
 
     let state = Arc::new(BotState::new(
         ChatId(group_chat_id),
@@ -301,10 +641,9 @@ async fn main() {
                     }
                 }),
         )
-        .branch(
-            dptree::entry().endpoint(handle_group_message), // Убрали фильтр .filter(|msg: Message| msg.text().is_some())
-        );
+        .branch(dptree::entry().endpoint(handle_group_message));
 
+    info!("Starting dispatcher...");
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state])
         .enable_ctrlc_handler()
