@@ -608,7 +608,9 @@ fn delete_message_later(bot: Bot, chat_id: ChatId, message_id: MessageId) {
 #[tokio::main]
 async fn main() {
     dotenv().ok();
-    pretty_env_logger::init();
+    pretty_env_logger::formatted_timed_builder()
+        .parse_default_env()
+        .init();
     info!("Starting verification bot...");
 
     let bot_token =
