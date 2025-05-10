@@ -9,3 +9,4 @@
 !rustfmt.toml
 !src/
 !src/**
+!README.md

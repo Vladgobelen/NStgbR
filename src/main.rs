@@ -83,16 +83,23 @@ struct BotState {
     whitelist_file: String,
     group_chat_id: ChatId,
     forbidden_patterns: Arc<Mutex<ForbiddenPatterns>>,
+    secret_code: String,
 }
 
 impl BotState {
-    fn new(group_chat_id: ChatId, whitelist_file: &str, patterns_file: &str) -> Self {
+    fn new(
+        group_chat_id: ChatId,
+        whitelist_file: &str,
+        patterns_file: &str,
+        secret_code: &str,
+    ) -> Self {
         info!("Initializing BotState for group {}", group_chat_id.0);
         Self {
             whitelist: Mutex::new(Self::load_whitelist(whitelist_file)),
             whitelist_file: whitelist_file.to_string(),
             group_chat_id,
             forbidden_patterns: Arc::new(Mutex::new(ForbiddenPatterns::load(patterns_file))),
+            secret_code: secret_code.to_string(),
         }
     }
 
@@ -156,6 +163,10 @@ impl BotState {
         }
         matches
     }
+
+    async fn check_secret_code(&self, text: &str) -> bool {
+        text.trim() == self.secret_code
+    }
 }
 
 async fn retry_telegram_request<F, T>(action: F, action_name: &str) -> Result<T>
@@ -163,7 +174,7 @@ where
     F: Fn() -> BoxFuture<'static, Result<T>>,
 {
     let mut attempts = 0;
-    let max_attempts = 3; // Уменьшено количество попыток для более быстрого реагирования
+    let max_attempts = 3;
     let mut last_error = None;
 
     while attempts < max_attempts {
@@ -178,7 +189,7 @@ where
             }
             Err(e) => {
                 last_error = Some(e);
-                let delay = Duration::from_millis(500 * attempts); // Уменьшена задержка между попытками
+                let delay = Duration::from_millis(500 * attempts);
                 warn!(
                     "Attempt {} of {} failed for {}: {:?}. Retrying in {:?}",
                     attempts, max_attempts, action_name, last_error, delay
@@ -437,7 +448,7 @@ async fn handle_group_message(bot: Bot, msg: Message, state: Arc<BotState>) -> R
             msg.text().unwrap_or("[non-text message]")
         );
 
-        // Проверяем команды только для текстовых сообщений
+        // Сначала проверяем команды
         if let Some(text) = msg.text() {
             if let Some(cmd) = Command::parse(text) {
                 info!("Detected command {:?} from user {}", cmd, user.id);
@@ -457,17 +468,50 @@ async fn handle_group_message(bot: Bot, msg: Message, state: Arc<BotState>) -> R
         let user_first_name = user.first_name.clone();
         let bot_clone = bot.clone();
 
-        // Для неподтверждённых пользователей удаляем ЛЮБОЕ сообщение
+        // Проверяем секретный код перед другими проверками
+        if let Some(text) = msg.text() {
+            if state.check_secret_code(text).await {
+                info!("User {} entered correct secret code", user.id);
+                let username = user
+                    .username
+                    .as_deref()
+                    .unwrap_or(&user.first_name)
+                    .to_owned();
+
+                if let Err(e) = state.add_to_whitelist(user.id, &username).await {
+                    error!("Failed to add to whitelist: {}", e);
+                } else {
+                    info!("User {} added to whitelist via secret code", user.id);
+                }
+
+                // Удаляем сообщение с кодом
+                if let Err(e) = retry_telegram_request(
+                    move || {
+                        let bot = bot_clone.clone();
+                        Box::pin(async move {
+                            bot.delete_message(chat_id, message_id)
+                                .await
+                                .map_err(|e| e.into())
+                        })
+                    },
+                    "delete secret code message",
+                )
+                .await
+                {
+                    error!("Failed to delete secret code message: {}", e);
+                }
+
+                return Ok(());
+            }
+        }
+
+        // Для неподтверждённых пользователей
         if !state.is_whitelisted(user.id).await {
             warn!("User {} is not whitelisted, deleting message", user.id);
             if let Err(e) = retry_telegram_request(
                 move || {
                     let bot = bot_clone.clone();
                     Box::pin(async move {
-                        info!(
-                            "Deleting message from unwhitelisted user {} in chat {}",
-                            user.id, chat_id
-                        );
                         bot.delete_message(chat_id, message_id)
                             .await
                             .map_err(|e| e.into())
@@ -483,10 +527,10 @@ async fn handle_group_message(bot: Bot, msg: Message, state: Arc<BotState>) -> R
                 );
             }
 
-            // Отправляем предупреждение только для текстовых сообщений (чтобы не спамить)
+            // Отправляем запрос на подтверждение только для текстовых сообщений
             if msg.text().is_some() {
                 info!(
-                    "Sending warning to unwhitelisted user {} in chat {}",
+                    "Sending confirmation request to user {} in chat {}",
                     user.id, chat_id
                 );
                 let bot_clone = bot.clone();
@@ -503,7 +547,7 @@ async fn handle_group_message(bot: Bot, msg: Message, state: Arc<BotState>) -> R
                             .map_err(|e| e.into())
                         })
                     },
-                    "send unwhitelisted warning",
+                    "send confirmation request",
                 )
                 .await?;
                 delete_message_later(bot.clone(), chat_id, response.id);
@@ -511,7 +555,7 @@ async fn handle_group_message(bot: Bot, msg: Message, state: Arc<BotState>) -> R
             return Ok(());
         }
 
-        // Для подтверждённых пользователей проверяем запрещённые паттерны в текстовых сообщениях
+        // Для подтверждённых пользователей проверяем запрещённые паттерны
         if let Some(text) = msg.text() {
             if state.check_message(text).await {
                 warn!(
@@ -523,10 +567,6 @@ async fn handle_group_message(bot: Bot, msg: Message, state: Arc<BotState>) -> R
                     move || {
                         let bot = bot_clone.clone();
                         Box::pin(async move {
-                            info!(
-                                "Deleting forbidden message from user {} in chat {}",
-                                user.id, chat_id
-                            );
                             bot.delete_message(chat_id, message_id)
                                 .await
                                 .map_err(|e| e.into())
@@ -548,10 +588,6 @@ async fn handle_group_message(bot: Bot, msg: Message, state: Arc<BotState>) -> R
                         let user_first_name = user_first_name.clone();
                         let bot = bot_clone.clone();
                         Box::pin(async move {
-                            info!(
-                                "Sending warning about forbidden pattern to user {} in chat {}",
-                                user.id, chat_id
-                            );
                             bot.send_message(
                                 chat_id,
                                 format!(
@@ -584,10 +620,6 @@ fn delete_message_later(bot: Bot, chat_id: ChatId, message_id: MessageId) {
             move || {
                 let bot = bot.clone();
                 Box::pin(async move {
-                    info!(
-                        "Executing scheduled deletion of message {} in chat {}",
-                        message_id, chat_id
-                    );
                     bot.delete_message(chat_id, message_id)
                         .await
                         .map_err(|e| e.into())
@@ -608,9 +640,27 @@ fn delete_message_later(bot: Bot, chat_id: ChatId, message_id: MessageId) {
 #[tokio::main]
 async fn main() {
     dotenv().ok();
-    pretty_env_logger::formatted_timed_builder()
-        .parse_default_env()
-        .init();
+
+    // Настройка логирования в файл
+    let log_config = fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "[{}][{}][{}] {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.target(),
+                record.level(),
+                message
+            ))
+        })
+        .level(log::LevelFilter::Info)
+        .chain(fern::log_file("bot.log").expect("Failed to create log file"))
+        .apply();
+
+    if let Err(e) = log_config {
+        eprintln!("Failed to initialize logging: {}", e);
+        return;
+    }
+
     info!("Starting verification bot...");
 
     let bot_token =
@@ -619,6 +669,7 @@ async fn main() {
         .unwrap_or("-1001380105834".to_string())
         .parse::<i64>()
         .expect("Invalid GROUP_CHAT_ID");
+    let secret_code = std::env::var("SECRET_CODE").unwrap_or_else(|_| "default_code".to_string());
 
     info!("Group chat ID: {}", group_chat_id);
 
@@ -627,6 +678,7 @@ async fn main() {
         &std::env::var("WHITELIST_FILE").unwrap_or_else(|_| "whitelist.txt".to_string()),
         &std::env::var("FORBIDDEN_PATTERNS_FILE")
             .unwrap_or_else(|_| "forbidden_patterns.txt".to_string()),
+        &secret_code,
     ));
 
     let bot = Bot::new(bot_token);
